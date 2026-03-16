@@ -1,0 +1,70 @@
+{
+  "name": "dev-agent",
+  "displayName": "Dev Agent — MuleSoft AI Assistant",
+  "description": "AI-powered RAML, DataWeave and Mule Flow generation directly in VS Code",
+  "version": "1.0.0",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["AI", "Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "devAgent",
+          "title": "Dev Agent",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "devAgent": [
+        {
+          "type": "webview",
+          "id": "devAgent.chatView",
+          "name": "MuleSoft AI Assistant"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "devAgent.openChat",
+        "title": "Dev Agent: Open Chat",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "devAgent.newSession",
+        "title": "Dev Agent: New Project Session"
+      },
+      {
+        "command": "devAgent.startServer",
+        "title": "Dev Agent: Start Server"
+      }
+    ],
+    "configuration": {
+      "title": "Dev Agent",
+      "properties": {
+        "devAgent.serverUrl": {
+          "type": "string",
+          "default": "http://localhost:8001",
+          "description": "URL of the Dev Agent Python server"
+        },
+        "devAgent.outputFolder": {
+          "type": "string",
+          "default": "",
+          "description": "Subfolder inside workspace to write generated files. Leave empty for workspace root."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0"
+  }
+}
