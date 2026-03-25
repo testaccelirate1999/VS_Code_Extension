@@ -5,20 +5,11 @@ import * as fs from "fs";
 
 export class FileWriter {
   private workspaceRoot: string;
-  private outputSubfolder: string;
 
   constructor() {
     this.workspaceRoot =
       vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "";
-    // Always write to raml/ subfolder — ignore outputFolder setting
-    this.outputSubfolder = "raml";
   }
-
-  private get baseDir(): string {
-    return path.join(this.workspaceRoot, "raml");
-  }
-
-  // ── Write a set of files from the agent ───────────────────────────────────
 
   async writeFiles(
     files: Record<string, string>,
@@ -34,59 +25,42 @@ export class FileWriter {
 
     const written: string[] = [];
 
-    // Write / update files
     for (const [relativePath, content] of Object.entries(files)) {
-      // Only write files that changed this turn (don't overwrite unchanged files)
       if (changedFiles.length > 0 && !changedFiles.includes(relativePath)) {
         continue;
       }
-      const fullPath = path.join(this.baseDir, relativePath);
+      const fullPath = path.join(this.workspaceRoot, relativePath);
       fs.mkdirSync(path.dirname(fullPath), { recursive: true });
       fs.writeFileSync(fullPath, content, "utf8");
       written.push(fullPath);
     }
 
-    // Delete removed files
     for (const relativePath of deletedFiles) {
-      const fullPath = path.join(this.baseDir, relativePath);
-      if (fs.existsSync(fullPath)) {
-        fs.unlinkSync(fullPath);
-      }
+      const fullPath = path.join(this.workspaceRoot, relativePath);
+      if (fs.existsSync(fullPath)) { fs.unlinkSync(fullPath); }
     }
 
-    // Open the first changed file in the editor
     if (written.length > 0) {
       const uri = vscode.Uri.file(written[0]);
       await vscode.window.showTextDocument(uri, {
-        preview: false,
-        viewColumn: vscode.ViewColumn.One,
+        preview: false, viewColumn: vscode.ViewColumn.One,
       });
     }
 
     return written;
   }
 
-  // ── Show a notification with quick-open links ─────────────────────────────
-
   showFilesNotification(written: string[]) {
-    if (written.length === 0) return;
-    const names = written
-      .map((f) => path.basename(f))
-      .slice(0, 3)
-      .join(", ");
+    if (written.length === 0) { return; }
+    const names = written.map((f) => path.basename(f)).slice(0, 3).join(", ");
     const extra = written.length > 3 ? ` +${written.length - 3} more` : "";
-    vscode.window
-      .showInformationMessage(
-        `Dev Agent wrote ${written.length} file(s): ${names}${extra}`,
-        "Open Folder"
-      )
-      .then((choice) => {
-        if (choice === "Open Folder") {
-          vscode.commands.executeCommand(
-            "revealInExplorer",
-            vscode.Uri.file(written[0])
-          );
-        }
-      });
+    vscode.window.showInformationMessage(
+      `Dev Agent wrote ${written.length} file(s): ${names}${extra}`,
+      "Open Folder"
+    ).then((choice) => {
+      if (choice === "Open Folder") {
+        vscode.commands.executeCommand("revealInExplorer", vscode.Uri.file(written[0]));
+      }
+    });
   }
 }

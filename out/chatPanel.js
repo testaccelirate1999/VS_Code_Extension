@@ -41,12 +41,21 @@ const https = __importStar(require("https"));
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const fileWriter_1 = require("./fileWriter");
+function getNonce() {
+    let text = "";
+    const possible = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    for (let i = 0; i < 32; i++) {
+        text += possible.charAt(Math.floor(Math.random() * possible.length));
+    }
+    return text;
+}
 class ChatPanel {
     constructor(context, serverManager) {
         this.context = context;
         this.serverManager = serverManager;
         this._messages = [];
-        // Use VS Code machine ID as user identifier — unique per machine, no login needed
+        this._mode = "plan";
+        this._nonce = "";
         this._userId = vscode.env.machineId;
         this._fileWriter = new fileWriter_1.FileWriter();
         this._panel = vscode.window.createWebviewPanel("devAgentChat", "Dev Agent", vscode.ViewColumn.Beside, {
@@ -54,7 +63,22 @@ class ChatPanel {
             retainContextWhenHidden: true,
             localResourceRoots: [context.extensionUri],
         });
+        this._nonce = getNonce();
         this._panel.webview.html = this._getHtml();
+        setTimeout(() => {
+            this._panel.webview.postMessage({
+                type: "serverStatus",
+                status: this.serverManager.status
+            });
+        }, 500);
+        // Fallback timeout in case ready message is delayed
+        let readyFired = false;
+        setTimeout(() => {
+            if (!readyFired) {
+                console.log("[DevAgent] fallback timeout firing");
+                this._onWebviewReady();
+            }
+        }, 3000);
         this._panel.onDidDispose(() => {
             this._fileWatcher?.dispose();
             ChatPanel.current = undefined;
@@ -70,11 +94,17 @@ class ChatPanel {
                 case "publish":
                     await this._handlePublish();
                     break;
+                case "setMode":
+                    this._setMode(msg.mode);
+                    break;
                 case "ready":
+                    readyFired = true;
+                    console.log("[DevAgent] ready message received from webview");
                     await this._onWebviewReady();
                     break;
             }
         });
+        console.log("case completed");
         serverManager.onStatusChange((status) => {
             this._panel.webview.postMessage({ type: "serverStatus", status });
         });
@@ -87,27 +117,72 @@ class ChatPanel {
         }
         ChatPanel.current = new ChatPanel(context, serverManager);
     }
-    // ── On webview ready — auto-init session from workspace ───────────────────
+    // ── Webview ready ─────────────────────────────────────────────────────────
     async _onWebviewReady() {
+        console.log("[DevAgent] _onWebviewReady called");
         const wsFolder = vscode.workspace.workspaceFolders?.[0];
-        if (!wsFolder)
+        console.log("[DevAgent] wsFolder:", wsFolder?.uri.fsPath);
+        if (!wsFolder) {
+            this._addSystemMessage("⚠️ No workspace folder open.");
             return;
+        }
         const projectName = path.basename(wsFolder.uri.fsPath);
+        const serverUrl = this.serverManager.serverUrl;
+        this._addSystemMessage("🔍 Connecting to: **" + serverUrl + "**");
         const alive = await this.serverManager.ping();
-        if (!alive)
+        console.log("[DevAgent] ping alive:", alive);
+        console.log("[DevAgent] serverUrl:", this.serverManager.serverUrl);
+        this._addSystemMessage("🔍 Ping result: **" + alive + "**");
+        this._addSystemMessage("🚀 Session initialized. You can start typing.");
+        this._panel.webview.postMessage({
+            type: "serverStatus",
+            status: this.serverManager.status
+        });
+        if (!alive) {
+            this._addSystemMessage("⚠️ Server not reachable. Check server is running.");
             return;
-        await this.startNewSession(projectName, /*autoInit*/ true);
+        }
+        await this.startNewSession(projectName, true);
+    }
+    // ── Mode ──────────────────────────────────────────────────────────────────
+    _setMode(mode) {
+        this._mode = mode;
+        this._panel.webview.postMessage({ type: "modeChanged", mode });
+        if (mode === "act") {
+            const hasPlan = this._messages.some(m => m.mode === "plan");
+            this._addSystemMessage(hasPlan
+                ? "🎯 Switched to **Act mode**. Plan summary will be sent with your next instruction."
+                : "🎯 Switched to **Act mode**. No plan yet — type your instruction directly.");
+        }
+        else {
+            this._addSystemMessage("📋 Switched to **Plan mode**. Describe what you want to build.");
+        }
+    }
+    _buildPlanSummary() {
+        const planMsgs = this._messages.filter(m => m.mode === "plan");
+        if (planMsgs.length === 0) {
+            return "";
+        }
+        const lines = planMsgs.map(m => (m.role === "user" ? "User" : "Agent") + ": " + m.content);
+        return ("=== PLANNING CONVERSATION ===\n" +
+            lines.join("\n") +
+            "\n=== END PLAN ===\n" +
+            "Based on the above planning conversation, now execute the user's instruction.");
     }
     // ── Session ───────────────────────────────────────────────────────────────
     async startNewSession(projectName, autoInit = false) {
+        console.log("[DevAgent] startNewSession:", projectName);
         try {
+            console.log("[DevAgent] calling /session/init");
             const resp = await this._post("/session/init", {
                 project_name: projectName,
                 user_id: this._userId,
             });
+            console.log("[DevAgent] session/init response:", JSON.stringify(resp));
             this._sessionId = resp.session_id;
             this._projectName = projectName;
             this._messages = [];
+            this._mode = "plan";
             this._post_message({
                 type: "sessionStarted",
                 projectName,
@@ -116,67 +191,74 @@ class ChatPanel {
                 fileCount: resp.file_count,
                 files: resp.files,
             });
+            this._panel.webview.postMessage({ type: "modeChanged", mode: "plan" });
             const label = autoInit ? "auto-opened" : "started";
             this._addSystemMessage(resp.is_new
-                ? `📁 New session ${label}: **${projectName}**`
-                : `📁 Resumed session for **${projectName}** (${resp.file_count} file(s) on disk)`);
-            // Start watching raml/ folder for manual edits
+                ? "📁 New session " + label + ": **" + projectName + "**"
+                : "📁 Resumed session for **" + projectName + "** (" + (resp.file_count ?? 0) + " file(s) on disk)");
+            if (resp.is_new) {
+                this._addSystemMessage("📋 You are in **Plan mode**. Describe your API requirements and I'll ask clarifying questions before generating anything.");
+            }
             this._startFileWatcher();
         }
         catch (e) {
+            console.log("[DevAgent] startNewSession error:", e.message);
             if (!autoInit) {
-                this._addSystemMessage(`❌ Could not init session: ${e.message}`);
+                this._addSystemMessage("❌ Could not init session: " + e.message);
             }
         }
     }
-    // ── Watch raml/ folder — sync manual edits back to session ───────────────
+    // ── File watcher ──────────────────────────────────────────────────────────
     _startFileWatcher() {
         this._fileWatcher?.dispose();
         const wsFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-        if (!wsFolder || !this._sessionId)
+        if (!wsFolder || !this._sessionId) {
             return;
-        const ramlDir = path.join(wsFolder, "raml");
-        const pattern = new vscode.RelativePattern(ramlDir, "**/*");
+        }
+        const pattern = new vscode.RelativePattern(wsFolder, "src/main/resources/api/**/*");
         this._fileWatcher = vscode.workspace.createFileSystemWatcher(pattern);
         const syncFile = async (uri) => {
-            if (!this._sessionId)
+            if (!this._sessionId) {
                 return;
+            }
             try {
                 const content = fs.readFileSync(uri.fsPath, "utf8");
-                const relativePath = path.relative(ramlDir, uri.fsPath).replace(/\\/g, "/");
-                await this._put(`/session/${this._sessionId}/files`, {
+                const relativePath = path.relative(wsFolder, uri.fsPath).replace(/\\/g, "/");
+                await this._put("/session/" + this._sessionId + "/files", {
                     files: { [relativePath]: content },
                 });
             }
-            catch { /* ignore read errors on delete */ }
+            catch { /* ignore */ }
         };
         this._fileWatcher.onDidChange(syncFile);
         this._fileWatcher.onDidCreate(syncFile);
     }
-    // ── Publish to Anypoint ───────────────────────────────────────────────────
+    // ── Publish ───────────────────────────────────────────────────────────────
     async _handlePublish() {
         if (!this._sessionId) {
             vscode.window.showErrorMessage("Dev Agent: No active session.");
             return;
         }
-        // Collect credentials via input boxes (pre-fill from env if available)
         const username = await vscode.window.showInputBox({
             prompt: "Anypoint Username", ignoreFocusOut: true,
             value: process.env.ANYPOINT_USERNAME || "",
         });
-        if (!username)
+        if (!username) {
             return;
+        }
         const password = await vscode.window.showInputBox({
             prompt: "Anypoint Password", password: true, ignoreFocusOut: true,
         });
-        if (!password)
+        if (!password) {
             return;
+        }
         const orgId = await vscode.window.showInputBox({
             prompt: "Anypoint Org ID", ignoreFocusOut: true,
             value: process.env.ANYPOINT_ORG_ID || "",
         });
-        if (!orgId)
+        if (!orgId) {
             return;
+        }
         const ownerId = await vscode.window.showInputBox({
             prompt: "Anypoint Owner ID (leave blank to use Org ID)",
             ignoreFocusOut: true,
@@ -192,48 +274,52 @@ class ChatPanel {
                 owner_id: ownerId || orgId,
             });
             if (result.success) {
-                this._addSystemMessage(`✅ Published to Anypoint! Action: **${result.action}**, ` +
-                    `Files: **${result.file_count}**`);
+                this._addSystemMessage("✅ Published to Anypoint! Action: **" + result.action + "**, Files: **" + result.file_count + "**");
             }
             else {
-                this._addSystemMessage(`❌ Publish failed: ${result.error}`);
+                this._addSystemMessage("❌ Publish failed: " + result.error);
             }
         }
         catch (e) {
-            this._addSystemMessage(`❌ Publish error: ${e.message}`);
+            this._addSystemMessage("❌ Publish error: " + e.message);
         }
     }
-    // ── Send a message ────────────────────────────────────────────────────────
+    // ── Send ──────────────────────────────────────────────────────────────────
     async _handleSend(text) {
-        if (!text.trim())
+        if (!text.trim()) {
             return;
+        }
         if (!this._sessionId) {
             const wsFolder = vscode.workspace.workspaceFolders?.[0];
             const name = wsFolder ? path.basename(wsFolder.uri.fsPath) : "New Project";
             await this.startNewSession(name);
         }
-        this._messages.push({ role: "user", content: text });
-        this._post_message({ type: "userMessage", text });
-        const assistantMsg = { role: "assistant", content: "", thinking: [] };
+        const userMsg = { role: "user", content: text, mode: this._mode };
+        this._messages.push(userMsg);
+        this._post_message({ type: "userMessage", text, mode: this._mode });
+        const assistantMsg = { role: "assistant", content: "", mode: this._mode, thinking: [] };
         this._messages.push(assistantMsg);
-        this._post_message({ type: "assistantStart" });
+        this._post_message({ type: "assistantStart", mode: this._mode });
         try {
-            await this._streamChat(text, assistantMsg);
+            const planSummary = this._mode === "act" ? this._buildPlanSummary() : "";
+            await this._streamChat(text, planSummary, assistantMsg);
         }
         catch (e) {
             this._post_message({
                 type: "assistantError",
-                text: `Server error: ${e.message}. Is the Dev Agent server running?`,
+                text: "Server error: " + e.message + ". Is the Dev Agent server running?",
             });
         }
     }
-    async _streamChat(text, assistantMsg) {
+    async _streamChat(text, planSummary, assistantMsg) {
         const serverUrl = this.serverManager.serverUrl;
-        const url = new URL(`${serverUrl}/chat`);
+        const url = new URL(serverUrl + "/chat");
         const body = JSON.stringify({
             message: text,
             session_id: this._sessionId,
             user_id: this._userId,
+            mode: this._mode,
+            plan_summary: planSummary,
         });
         return new Promise((resolve, reject) => {
             const lib = url.protocol === "https:" ? https : http;
@@ -254,8 +340,9 @@ class ChatPanel {
                     const lines = buffer.split("\n");
                     buffer = lines.pop() ?? "";
                     for (const line of lines) {
-                        if (!line.startsWith("data: "))
+                        if (!line.startsWith("data: ")) {
                             continue;
+                        }
                         try {
                             const event = JSON.parse(line.slice(6));
                             this._handleSseEvent(event, assistantMsg);
@@ -282,7 +369,6 @@ class ChatPanel {
                 this._post_message({ type: "toolDone", tool: event.tool, summary: event.summary });
                 break;
             case "files": {
-                // Write to raml/ subfolder in workspace
                 const written = await this._fileWriter.writeFiles(event.files, event.changed_files ?? [], event.deleted_files ?? []);
                 if (written.length > 0) {
                     this._fileWriter.showFilesNotification(written);
@@ -313,7 +399,7 @@ class ChatPanel {
     // ── HTTP helpers ──────────────────────────────────────────────────────────
     _post(urlPath, body) {
         return new Promise((resolve, reject) => {
-            const url = new URL(`${this.serverManager.serverUrl}${urlPath}`);
+            const url = new URL(this.serverManager.serverUrl + urlPath);
             const payload = JSON.stringify(body);
             const lib = url.protocol === "https:" ? https : http;
             const req = lib.request({
@@ -329,7 +415,7 @@ class ChatPanel {
                         resolve(JSON.parse(data));
                     }
                     catch {
-                        reject(new Error(`Invalid JSON: ${data}`));
+                        reject(new Error("Invalid JSON: " + data));
                     }
                 });
             });
@@ -340,7 +426,7 @@ class ChatPanel {
     }
     _put(urlPath, body) {
         return new Promise((resolve, reject) => {
-            const url = new URL(`${this.serverManager.serverUrl}${urlPath}`);
+            const url = new URL(this.serverManager.serverUrl + urlPath);
             const payload = JSON.stringify(body);
             const lib = url.protocol === "https:" ? https : http;
             const req = lib.request({
@@ -356,7 +442,7 @@ class ChatPanel {
                         resolve(JSON.parse(data));
                     }
                     catch {
-                        reject(new Error(`Invalid JSON: ${data}`));
+                        reject(new Error("Invalid JSON: " + data));
                     }
                 });
             });
@@ -371,11 +457,12 @@ class ChatPanel {
     _addSystemMessage(text) {
         this._post_message({ type: "systemMessage", text });
     }
-    // ── Webview HTML ──────────────────────────────────────────────────────────
+    // ── HTML ──────────────────────────────────────────────────────────────────
     _getHtml() {
         return /* html */ `<!DOCTYPE html>
 <html lang="en">
 <head>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-${this._nonce}'; style-src 'unsafe-inline'; connect-src http://localhost:*;">
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Dev Agent</title>
@@ -392,14 +479,11 @@ class ChatPanel {
     overflow:    hidden;
   }
   #header {
-    display:         flex;
-    align-items:     center;
-    justify-content: space-between;
-    padding:         10px 14px;
-    background:      var(--vscode-titleBar-activeBackground);
-    border-bottom:   1px solid var(--vscode-widget-border);
-    flex-shrink:     0;
-    gap:             8px;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 14px;
+    background: var(--vscode-titleBar-activeBackground);
+    border-bottom: 1px solid var(--vscode-widget-border);
+    flex-shrink: 0; gap: 8px;
   }
   #header h1 { font-size: 13px; font-weight: 600; flex: 1; }
   #server-badge {
@@ -427,6 +511,27 @@ class ChatPanel {
     border-radius: 4px; padding: 3px 10px; cursor: pointer; font-size: 11px;
   }
   #session-bar button:hover { opacity: 0.85; }
+  #mode-bar {
+    display: flex; align-items: center; gap: 6px; padding: 6px 14px;
+    border-bottom: 1px solid var(--vscode-widget-border); flex-shrink: 0;
+  }
+  #mode-bar span { font-size: 11px; color: var(--vscode-descriptionForeground); }
+  .mode-btn {
+    font-size: 11px; padding: 3px 14px; border-radius: 20px; cursor: pointer;
+    border: 1px solid var(--vscode-widget-border);
+    background: var(--vscode-editor-background); color: var(--vscode-foreground);
+  }
+  .mode-btn.active.plan { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
+  .mode-btn.active.act  { background: #1a7f37; color: #fff; border-color: #1a7f37; }
+  #mode-hint {
+    font-size: 10px; padding: 3px 14px; flex-shrink: 0;
+    border-bottom: 1px solid var(--vscode-widget-border);
+    color: var(--vscode-descriptionForeground);
+  }
+  #mode-hint.plan { color: #60a5fa; }
+  #mode-hint.act  { color: #4ade80; }
+  .msg.user.plan .bubble { background: #1d4ed8; color: #fff; }
+  .msg.user.act  .bubble { background: #1a7f37; color: #fff; }
   #messages {
     flex: 1; overflow-y: auto; padding: 16px 14px;
     display: flex; flex-direction: column; gap: 16px;
@@ -519,13 +624,20 @@ class ChatPanel {
 <div id="header">
   <h1>⚡ Dev Agent</h1>
   <span id="server-badge" class="stopped">● Stopped</span>
-  <button id="publish-btn" onclick="publishToAnypoint()" disabled title="Publish to Anypoint Exchange">↑ Publish</button>
+  <button id="publish-btn" disabled title="Publish to Anypoint Exchange">↑ Publish</button>
 </div>
 
 <div id="session-bar">
   <span id="session-label">Initialising…</span>
-  <button onclick="promptNewSession()">＋ New Session</button>
+  <button id="new-session-btn">＋ New Session</button>
 </div>
+
+<div id="mode-bar">
+  <span>Mode:</span>
+  <button class="mode-btn active plan" id="btn-plan">📋 Plan</button>
+  <button class="mode-btn act"         id="btn-act">🎯 Act</button>
+</div>
+<div id="mode-hint" class="plan">📋 Plan mode — describe requirements, no files generated</div>
 
 <div id="messages">
   <div class="msg system">
@@ -537,7 +649,7 @@ class ChatPanel {
   <div id="input-wrapper">
     <textarea id="input" rows="1"
       placeholder="Describe the API you want to create…"></textarea>
-    <button id="send-btn" title="Send (Enter)" onclick="sendMessage()">
+    <button id="send-btn" title="Send (Enter)">
       <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
         <path d="M1.5 1.5l13 6.5-13 6.5V9.5l9-1.5-9-1.5V1.5z"/>
       </svg>
@@ -546,7 +658,7 @@ class ChatPanel {
   <div id="hint">Enter to send · Shift+Enter for new line</div>
 </div>
 
-<script>
+<script nonce="${this._nonce}">
 const vscode      = acquireVsCodeApi();
 let isStreaming   = false;
 let hasSession    = false;
@@ -554,6 +666,20 @@ let currentAssistantEl = null;
 
 // ── Auto-resize textarea ──────────────────────────────────────────────────
 const input = document.getElementById('input');
+
+document.getElementById('send-btn').addEventListener('click', sendMessage);
+
+document.getElementById('btn-plan').addEventListener('click', () => {
+  vscode.postMessage({ type: 'setMode', mode: 'plan' });
+});
+
+document.getElementById('btn-act').addEventListener('click', () => {
+  vscode.postMessage({ type: 'setMode', mode: 'act' });
+});
+
+document.getElementById('new-session-btn').addEventListener('click', promptNewSession);
+
+document.getElementById('publish-btn').addEventListener('click', publishToAnypoint);
 input.addEventListener('input', () => {
   input.style.height = 'auto';
   input.style.height = Math.min(input.scrollHeight, 140) + 'px';
@@ -670,6 +796,15 @@ window.addEventListener('message', e => {
       b.textContent = msg.status === 'running'  ? '● Running'  :
                       msg.status === 'starting' ? '● Starting…':
                       msg.status === 'error'    ? '● Error'    : '● Stopped';
+      break;
+    }
+    case 'modeChanged': {
+      const btnPlan = document.getElementById('btn-plan');
+      const btnAct  = document.getElementById('btn-act');
+
+      btnPlan.classList.toggle('active', msg.mode === 'plan');
+      btnAct.classList.toggle('active', msg.mode === 'act');
+
       break;
     }
     case 'sessionStarted':
