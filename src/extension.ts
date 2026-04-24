@@ -10,11 +10,26 @@ export function activate(context: vscode.ExtensionContext) {
 
   serverManager = new ServerManager(context);
 
+  // ── Register the sidebar WebviewViewProvider ───────────────────────────────
+  // This is what makes the activity-bar icon open/reopen the panel reliably.
+  // VS Code calls resolveWebviewView() automatically whenever the view becomes
+  // visible — first open, after close, after a window reload.
+  const chatPanel = new ChatPanel(context, serverManager);
+
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(
+      ChatPanel.VIEW_ID,   // must match the "id" in package.json views entry
+      chatPanel,
+      { webviewOptions: { retainContextWhenHidden: true } }
+    )
+  );
+
   // ── Commands ───────────────────────────────────────────────────────────────
 
   context.subscriptions.push(
     vscode.commands.registerCommand("devAgent.openChat", () => {
-      ChatPanel.createOrShow(context, serverManager);
+      // Focus the sidebar view (works whether it's already open or collapsed)
+      vscode.commands.executeCommand("devAgent.chatView.focus");
     }),
 
     vscode.commands.registerCommand("devAgent.newSession", async () => {
@@ -23,16 +38,13 @@ export function activate(context: vscode.ExtensionContext) {
         placeHolder: "My API",
       });
       if (name) {
-        ChatPanel.createOrShow(context, serverManager);
+        vscode.commands.executeCommand("devAgent.chatView.focus");
         ChatPanel.current?.startNewSession(name);
       }
     })
   );
 
-  // ── Open chat panel ────────────────────────────────────────────────────────
-  ChatPanel.createOrShow(context, serverManager);
-
-  // ── Check server is reachable, then poll every 15s ────────────────────────
+  // ── Server polling ─────────────────────────────────────────────────────────
   serverManager.checkAndNotify();
   serverManager.startPolling(15000);
 }

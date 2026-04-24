@@ -1,19 +1,26 @@
 {
   "name": "dev-agent",
-  "displayName": "Dev Agent — MuleSoft AI Assistant",
+  "displayName": "Flow Agent \u2014 Accelirate's MuleSoft Assistant",
   "description": "AI-powered RAML, DataWeave and Mule Flow generation directly in VS Code",
   "version": "1.0.0",
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["AI", "Other"],
-  "activationEvents": ["onStartupFinished"],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "viewsContainers": {
       "activitybar": [
         {
           "id": "devAgent",
-          "title": "Dev Agent",
-          "icon": "media/icon.svg"
+          "title": "Flow Agent",
+          "icon": "media/sidebar.png"
         }
       ]
     },
@@ -22,32 +29,32 @@
         {
           "type": "webview",
           "id": "devAgent.chatView",
-          "name": "MuleSoft AI Assistant"
+          "name": "Accelirate's MuleSoft Assistant"
         }
       ]
     },
     "commands": [
       {
         "command": "devAgent.openChat",
-        "title": "Dev Agent: Open Chat",
+        "title": "Flow Agent: Open Chat",
         "icon": "$(comment-discussion)"
       },
       {
         "command": "devAgent.newSession",
-        "title": "Dev Agent: New Project Session"
+        "title": "Flow Agent: New Project Session"
       },
       {
         "command": "devAgent.startServer",
-        "title": "Dev Agent: Start Server"
+        "title": "Flow Agent: Start Server"
       }
     ],
     "configuration": {
-      "title": "Dev Agent",
+      "title": "Flow Agent",
       "properties": {
         "devAgent.serverUrl": {
           "type": "string",
           "default": "http://localhost:8001",
-          "description": "URL of the Dev Agent Python server"
+          "description": "URL of the Flow Agent Python server"
         },
         "devAgent.outputFolder": {
           "type": "string",
@@ -66,5 +73,6 @@
     "@types/vscode": "^1.85.0",
     "@types/node": "^20.0.0",
     "typescript": "^5.3.0"
-  }
+  },
+  "icon": "media/chat.png"
 }

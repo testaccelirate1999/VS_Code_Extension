@@ -24,9 +24,13 @@ function getNonce(): string {
   return text;
 }
 
-export class ChatPanel {
+export class ChatPanel implements vscode.WebviewViewProvider {
+  public static readonly VIEW_ID = "devAgent.chatView";
   public static current: ChatPanel | undefined;
-  private readonly _panel: vscode.WebviewPanel;
+
+  // The active WebviewView assigned by VS Code when the sidebar panel is opened
+  private _view: vscode.WebviewView | undefined;
+
   private _sessionId: string | undefined;
   private _userId: string;
   private _projectName: string | undefined;
@@ -36,125 +40,123 @@ export class ChatPanel {
   private _mode: "plan" | "act" = "plan";
   private _nonce: string = "";
 
-  private constructor(
+  constructor(
     private context: vscode.ExtensionContext,
     private serverManager: ServerManager
   ) {
     this._userId = vscode.env.machineId;
     this._fileWriter = new FileWriter();
+    ChatPanel.current = this;
 
-    this._panel = vscode.window.createWebviewPanel(
-      "devAgentChat",
-      "Dev Agent",
-      vscode.ViewColumn.Beside,
-      {
-        enableScripts: true,
-        retainContextWhenHidden: true,
-        localResourceRoots: [context.extensionUri],
-      }
-    );
+    // Keep UI in sync whenever the server status changes
+    serverManager.onStatusChange((status) => {
+      this._view?.webview.postMessage({ type: "serverStatus", status });
+    });
+  }
+
+  // ── WebviewViewProvider entry point (called by VS Code) ───────────────────
+
+  resolveWebviewView(
+    webviewView: vscode.WebviewView,
+    _context: vscode.WebviewViewResolveContext,
+    _token: vscode.CancellationToken
+  ) {
+    this._view = webviewView;
+
+    webviewView.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [this.context.extensionUri],
+    };
 
     this._nonce = getNonce();
-    this._panel.webview.html = this._getHtml();
-    setTimeout(() => {
-      this._panel.webview.postMessage({
-        type: "serverStatus",
-        status: this.serverManager.status
-      });
-    }, 500);
+    webviewView.webview.html = this._getHtml();
 
-// Fallback timeout in case ready message is delayed
-    let readyFired = false;
+    // Send current server status once the view is ready
     setTimeout(() => {
+      webviewView.webview.postMessage({
+        type: "serverStatus",
+        status: this.serverManager.status,
+      });
+    }, 300);
+
+    // Fallback in case the webview 'ready' message is delayed
+    let readyFired = false;
+    const fallback = setTimeout(() => {
       if (!readyFired) {
+        readyFired = true;
         console.log("[DevAgent] fallback timeout firing");
         this._onWebviewReady();
       }
     }, 3000);
 
-    this._panel.onDidDispose(() => {
+    webviewView.onDidDispose(() => {
+      clearTimeout(fallback);
       this._fileWatcher?.dispose();
-      ChatPanel.current = undefined;
+      // Don't null out ChatPanel.current — the provider instance stays alive
+      // so that VS Code can call resolveWebviewView again when re-opened
     });
 
-    this._panel.webview.onDidReceiveMessage(async (msg) => {
+    webviewView.webview.onDidReceiveMessage(async (msg) => {
       switch (msg.type) {
         case "send":       await this._handleSend(msg.text); break;
         case "newSession": await this.startNewSession(msg.name); break;
         case "publish":    await this._handlePublish(); break;
         case "setMode":    this._setMode(msg.mode); break;
         case "ready":
-          readyFired = true;
-          console.log("[DevAgent] ready message received from webview");
-          await this._onWebviewReady();
+          if (!readyFired) {
+            readyFired = true;
+            clearTimeout(fallback);
+            console.log("[DevAgent] ready message received from webview");
+            await this._onWebviewReady();
+          }
           break;
       }
     });
-    console.log("case completed");
-    serverManager.onStatusChange((status) => {
-      this._panel.webview.postMessage({ type: "serverStatus", status });
-    });
   }
 
-  // ── Factory ───────────────────────────────────────────────────────────────
+  // ── Factory — now just a registration helper ───────────────────────────────
 
   static createOrShow(context: vscode.ExtensionContext, serverManager: ServerManager) {
-    if (ChatPanel.current) {
-      ChatPanel.current._panel.reveal(vscode.ViewColumn.Beside);
-      return;
-    }
-    ChatPanel.current = new ChatPanel(context, serverManager);
+    // The provider is registered in extension.ts; just focus the view
+    vscode.commands.executeCommand("devAgent.chatView.focus");
   }
 
   // ── Webview ready ─────────────────────────────────────────────────────────
 
   private async _onWebviewReady() {
-  console.log("[DevAgent] _onWebviewReady called");
-  const wsFolder = vscode.workspace.workspaceFolders?.[0];
-  console.log("[DevAgent] wsFolder:", wsFolder?.uri.fsPath);
-  if (!wsFolder) {
-    this._addSystemMessage("⚠️ No workspace folder open.");
-    return;
+    console.log("[DevAgent] _onWebviewReady called");
+    const wsFolder = vscode.workspace.workspaceFolders?.[0];
+    console.log("[DevAgent] wsFolder:", wsFolder?.uri.fsPath);
+    if (!wsFolder) {
+      this._addSystemMessage("⚠️ No workspace folder open.");
+      return;
+    }
+
+    const projectName = path.basename(wsFolder.uri.fsPath);
+
+    const alive = await this.serverManager.ping();
+    console.log("[DevAgent] ping alive:", alive);
+    console.log("[DevAgent] serverUrl:", this.serverManager.serverUrl);
+
+    this._view?.webview.postMessage({
+      type: "serverStatus",
+      status: this.serverManager.status,
+    });
+
+    if (!alive) {
+      this._addSystemMessage("⚠️ Server not reachable. Check server is running.");
+      return;
+    }
+
+    await this.startNewSession(projectName, true);
   }
-
-  const projectName = path.basename(wsFolder.uri.fsPath);
-  const serverUrl   = this.serverManager.serverUrl;
-  this._addSystemMessage("🔍 Connecting to: **" + serverUrl + "**");
-
-  const alive = await this.serverManager.ping();
-  console.log("[DevAgent] ping alive:", alive);
-  console.log("[DevAgent] serverUrl:", this.serverManager.serverUrl);
-
-  this._addSystemMessage("🔍 Ping result: **" + alive + "**");
-  this._addSystemMessage("🚀 Session initialized. You can start typing.");
-  this._panel.webview.postMessage({
-  type: "serverStatus",
-  status: this.serverManager.status
-});
-
-  if (!alive) {
-    this._addSystemMessage("⚠️ Server not reachable. Check server is running.");
-    return;
-  }
-
-  await this.startNewSession(projectName, true);
-}
 
   // ── Mode ──────────────────────────────────────────────────────────────────
 
   private _setMode(mode: "plan" | "act") {
     this._mode = mode;
-    this._panel.webview.postMessage({ type: "modeChanged", mode });
-    if (mode === "act") {
-      const hasPlan = this._messages.some(m => m.mode === "plan");
-      this._addSystemMessage(
-        hasPlan
-          ? "🎯 Switched to **Act mode**. Plan summary will be sent with your next instruction."
-          : "🎯 Switched to **Act mode**. No plan yet — type your instruction directly."
-      );
-    } else {
-      this._addSystemMessage("📋 Switched to **Plan mode**. Describe what you want to build.");
-    }
+    this._view?.webview.postMessage({ type: "modeChanged", mode });
+    // No chat notification — the UI theme change makes the switch self-evident
   }
 
   private _buildPlanSummary(): string {
@@ -196,20 +198,16 @@ export class ChatPanel {
         files:      resp.files,
       });
 
-      this._panel.webview.postMessage({ type: "modeChanged", mode: "plan" });
+      this._view?.webview.postMessage({ type: "modeChanged", mode: "plan" });
 
-      const label = autoInit ? "auto-opened" : "started";
+      if (!autoInit) {
       this._addSystemMessage(
         resp.is_new
-          ? "📁 New session " + label + ": **" + projectName + "**"
+          ? "📁 New session started: **" + projectName + "**"
           : "📁 Resumed session for **" + projectName + "** (" + (resp.file_count ?? 0) + " file(s) on disk)"
       );
-
-      if (resp.is_new) {
-        this._addSystemMessage(
-          "📋 You are in **Plan mode**. Describe your API requirements and I'll ask clarifying questions before generating anything."
-        );
-      }
+    }
+      this._addSystemMessage("🚀 All set. Go ahead.");
 
       this._startFileWatcher();
     } catch (e: any) {
@@ -249,7 +247,7 @@ export class ChatPanel {
 
   private async _handlePublish() {
     if (!this._sessionId) {
-      vscode.window.showErrorMessage("Dev Agent: No active session.");
+      vscode.window.showErrorMessage("Flow Agent: No active session.");
       return;
     }
 
@@ -323,7 +321,7 @@ export class ChatPanel {
     } catch (e: any) {
       this._post_message({
         type: "assistantError",
-        text: "Server error: " + e.message + ". Is the Dev Agent server running?",
+        text: "Server error: " + e.message + ". Is the Flow Agent server running?",
       });
     }
   }
@@ -417,6 +415,30 @@ export class ChatPanel {
       case "error":
         this._post_message({ type: "assistantError", text: event.message });
         break;
+      case "context_reset": {
+        this._addSystemMessage(
+          "⚠️ Context limit reached — summarized and continuing automatically…"
+        );
+        // Build a new assistantMsg for the retry
+        const retryAssistantMsg: Message = {
+          role: "assistant", content: "", mode: this._mode, thinking: []
+        };
+        this._messages.push(retryAssistantMsg);
+        this._post_message({ type: "assistantStart", mode: this._mode });
+
+        // Wait 1 second then retry with summary prepended
+        setTimeout(async () => {
+          const retryText =
+            `[CONTEXT SUMMARY]\n${event.summary}\n\n` +
+            `[USER REQUEST] ${event.message}`;
+          try {
+            await this._streamChat(retryText, "", retryAssistantMsg);
+          } catch (e: any) {
+            this._post_message({ type: "assistantError", text: e.message });
+          }
+        }, 1000);
+        break;
+      }
     }
   }
 
@@ -477,7 +499,7 @@ export class ChatPanel {
   }
 
   private _post_message(msg: object) {
-    this._panel.webview.postMessage(msg);
+    this._view?.webview.postMessage(msg);
   }
 
   private _addSystemMessage(text: string) {
@@ -490,10 +512,10 @@ export class ChatPanel {
     return /* html */`<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-${this._nonce}'; style-src 'unsafe-inline'; connect-src http://localhost:*;">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-${this._nonce}'; style-src 'unsafe-inline'; img-src data:; connect-src http://localhost:*;">
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Dev Agent</title>
+<title>Flow Agent</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -549,17 +571,33 @@ export class ChatPanel {
     border: 1px solid var(--vscode-widget-border);
     background: var(--vscode-editor-background); color: var(--vscode-foreground);
   }
-  .mode-btn.active.plan { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
-  .mode-btn.active.act  { background: #1a7f37; color: #fff; border-color: #1a7f37; }
+  /* ── Plan mode (green) ── */
+  body.mode-plan .mode-btn.active { background: #15803d; color: #fff; border-color: #15803d; }
+  body.mode-plan #mode-hint       { color: #4ade80; background: #052e1608; border-bottom-color: #15803d40; }
+  body.mode-plan #send-btn        { background: #15803d; }
+  body.mode-plan #input-wrapper:focus-within { border-color: #4ade80; }
+  body.mode-plan #input-wrapper   { border-color: #15803d50; }
+  body.mode-plan .msg.user .bubble { background: #15803d; color: #fff; }
+
+  /* ── Act mode (blue) ── */
+  body.mode-act .mode-btn.active  { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
+  body.mode-act #mode-hint        { color: #60a5fa; background: #0c1d4208; border-bottom-color: #1d4ed840; }
+  body.mode-act #send-btn         { background: #1d4ed8; }
+  body.mode-act #input-wrapper:focus-within { border-color: #60a5fa; }
+  body.mode-act #input-wrapper    { border-color: #1d4ed850; }
+  body.mode-act .msg.user .bubble  { background: #1d4ed8; color: #fff; }
+
+  /* active button always gets the mode colour — inactive stays neutral */
+  .mode-btn.active.plan { background: #15803d; color: #fff; border-color: #15803d; }
+  .mode-btn.active.act  { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
   #mode-hint {
     font-size: 10px; padding: 3px 14px; flex-shrink: 0;
     border-bottom: 1px solid var(--vscode-widget-border);
     color: var(--vscode-descriptionForeground);
+    transition: color 0.25s, background 0.25s, border-bottom-color 0.25s;
   }
-  #mode-hint.plan { color: #60a5fa; }
-  #mode-hint.act  { color: #4ade80; }
-  .msg.user.plan .bubble { background: #1d4ed8; color: #fff; }
-  .msg.user.act  .bubble { background: #1a7f37; color: #fff; }
+  #send-btn { transition: background 0.25s; }
+  #input-wrapper { transition: border-color 0.25s; }
   #messages {
     flex: 1; overflow-y: auto; padding: 16px 14px;
     display: flex; flex-direction: column; gap: 16px;
@@ -645,12 +683,18 @@ export class ChatPanel {
   #send-btn:hover { opacity: 0.85; }
   #send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   #hint { font-size: 10px; color: var(--vscode-descriptionForeground); margin-top: 5px; text-align: center; }
+  #brand-logo { width: 36px; height: 36px; vertical-align: middle; margin-right: 8px; flex-shrink: 0; }
+  #header h1  { display: flex; align-items: center; font-size: 13px; font-weight: 600; flex: 1; }
 </style>
 </head>
-<body>
+<body class="mode-plan">
 
 <div id="header">
-  <h1>⚡ Dev Agent</h1>
+  <h1>
+    <!-- Accelirate-A chevron left + MuleSoft-M arc right, merged into one mark -->
+    <img id="brand-logo" src="data:image/png;base64,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" alt="Flow Agent logo"/>
+    Flow Agent
+  </h1>
   <span id="server-badge" class="stopped">● Stopped</span>
   <button id="publish-btn" disabled title="Publish to Anypoint Exchange">↑ Publish</button>
 </div>
@@ -665,11 +709,11 @@ export class ChatPanel {
   <button class="mode-btn active plan" id="btn-plan">📋 Plan</button>
   <button class="mode-btn act"         id="btn-act">🎯 Act</button>
 </div>
-<div id="mode-hint" class="plan">📋 Plan mode — describe requirements, no files generated</div>
+<div id="mode-hint" class="plan">📋 Plan mode — describe what to build. No files will be written yet</div>
 
 <div id="messages">
   <div class="msg system">
-    <div class="bubble">Connecting to Dev Agent server…</div>
+    <div class="bubble">Connecting to Flow Agent server…</div>
   </div>
 </div>
 
@@ -724,8 +768,47 @@ function sendMessage() {
   vscode.postMessage({ type: 'send', text });
 }
 function promptNewSession() {
-  const name = prompt('Project name:');
-  if (name?.trim()) vscode.postMessage({ type: 'newSession', name: name.trim() });
+  const existing = document.getElementById('new-session-input-row');
+  if (existing) { existing.remove(); return; }
+
+  const row = document.createElement('div');
+  row.id = 'new-session-input-row';
+  row.style.cssText = 'display:flex;gap:6px;padding:6px 12px;background:var(--vscode-input-background);border-top:1px solid var(--vscode-panel-border)';
+
+  const inp = document.createElement('input');
+  inp.type = 'text';
+  inp.placeholder = 'Project name…';
+  inp.style.cssText = 'flex:1;background:transparent;border:1px solid var(--vscode-input-border);color:var(--vscode-input-foreground);padding:4px 8px;border-radius:4px;outline:none';
+
+  const btn = document.createElement('button');
+  btn.textContent = 'Create';
+  btn.style.cssText = 'padding:4px 10px;background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:none;border-radius:4px;cursor:pointer';
+
+  const confirm = () => {
+    const name = inp.value.trim();
+    if (name) { vscode.postMessage({ type: 'newSession', name }); }
+    row.remove();
+  };
+
+  inp.addEventListener('keydown', e => {
+    if (e.key === 'Enter') confirm();
+    if (e.key === 'Escape') row.remove();
+  });
+  btn.addEventListener('click', confirm);
+
+  const cancel = document.createElement('button');
+  cancel.textContent = '✕';
+  cancel.title = 'Cancel';
+  cancel.style.cssText = 'padding:4px 8px;background:transparent;color:var(--vscode-descriptionForeground);border:1px solid var(--vscode-widget-border);border-radius:4px;cursor:pointer;font-size:13px;line-height:1;flex-shrink:0';
+  cancel.addEventListener('click', () => row.remove());
+
+  row.appendChild(inp);
+  row.appendChild(btn);
+  row.appendChild(cancel);
+
+  const inputArea = document.getElementById('input-area');
+  inputArea.parentNode.insertBefore(row, inputArea);
+  inp.focus();
 }
 function publishToAnypoint() {
   vscode.postMessage({ type: 'publish' });
@@ -789,7 +872,7 @@ function addFilesBadge(count, changedFiles) {
   const b = document.createElement('div'); b.className = 'files-badge';
   const names = (changedFiles||[]).slice(0,3).join(', ');
   const extra = (changedFiles||[]).length > 3 ? \` +\${changedFiles.length-3} more\` : '';
-  b.textContent = \`📄 \${count} file(s) written to raml/: \${names}\${extra}\`;
+  b.textContent = \`📄 \${count} file(s) written: \${names}\${extra}\`;
   currentAssistantEl.bubble.appendChild(b); scrollToBottom();
 }
 function finishBubble() {
@@ -829,10 +912,19 @@ window.addEventListener('message', e => {
     case 'modeChanged': {
       const btnPlan = document.getElementById('btn-plan');
       const btnAct  = document.getElementById('btn-act');
-
       btnPlan.classList.toggle('active', msg.mode === 'plan');
-      btnAct.classList.toggle('active', msg.mode === 'act');
+      btnAct.classList.toggle('active',  msg.mode === 'act');
 
+      // Apply body-level theme so the whole UI shifts colour
+      document.body.classList.toggle('mode-plan', msg.mode === 'plan');
+      document.body.classList.toggle('mode-act',  msg.mode === 'act');
+
+      // Update hint bar text + class
+      const hint = document.getElementById('mode-hint');
+      hint.className = msg.mode;
+      hint.textContent = msg.mode === 'plan'
+        ? '📋 Plan mode — describe what to build. No files will be written yet.'
+        : '🎯 Act mode — your message will trigger file generation in the workspace';
       break;
     }
     case 'sessionStarted':
