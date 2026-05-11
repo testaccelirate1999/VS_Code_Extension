@@ -210,6 +210,12 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       this._addSystemMessage("🚀 All set. Go ahead.");
 
       this._startFileWatcher();
+
+      if (resp.is_new) {
+          // Workspace already has files (e.g. after a crash/reload)
+          // Scan and upload them so the new session knows what exists
+          await this._syncWorkspaceToSession(resp.session_id);
+      }
     } catch (e: any) {
       console.log("[DevAgent] startNewSession error:", e.message);
       if (!autoInit) {
@@ -242,7 +248,65 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     this._fileWatcher.onDidChange(syncFile);
     this._fileWatcher.onDidCreate(syncFile);
   }
+// ── File Sync ──────────────────────────────────────────────────────────
+  private async _syncWorkspaceToSession(sessionId: string): Promise<void> {
+    const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!wsRoot) { return; }
 
+    const filesToSync: Record<string, string> = {};
+    const scanDirs = [
+        "src/main/mule",
+        "src/main/resources",
+        "src/test/munit",
+        "src/test/resources",
+    ];
+
+    for (const dir of scanDirs) {
+        const fullDir = path.join(wsRoot, dir);
+        if (!fs.existsSync(fullDir)) { continue; }
+
+        this._scanDir(fullDir, wsRoot, filesToSync);
+    }
+
+    // Also pick up root-level files
+    for (const f of ["pom.xml", "mule-artifact.json", "log4j2.xml"]) {
+        const fullPath = path.join(wsRoot, f);
+        if (fs.existsSync(fullPath)) {
+            filesToSync[f] = fs.readFileSync(fullPath, "utf8");
+        }
+    }
+
+    if (Object.keys(filesToSync).length === 0) { return; }
+
+    console.log(`[DevAgent] Syncing ${Object.keys(filesToSync).length} existing workspace files to new session`);
+
+    try {
+        await this._put(`/session/${sessionId}/files`, { files: filesToSync });
+        this._addSystemMessage(
+            `📂 Found ${Object.keys(filesToSync).length} existing file(s) in workspace — synced to new session.`
+        );
+    } catch (e: any) {
+        console.error("[DevAgent] Workspace sync failed:", e.message);
+    }
+}
+
+  private _scanDir(
+      dirPath: string,
+      wsRoot: string,
+      result: Record<string, string>
+  ): void {
+      for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
+          const full = path.join(dirPath, entry.name);
+          if (entry.isDirectory()) {
+              this._scanDir(full, wsRoot, result);
+          } else if (entry.isFile()) {
+              const relative = path.relative(wsRoot, full).replace(/\\/g, "/");
+              try {
+                  result[relative] = fs.readFileSync(full, "utf8");
+              } catch { /* skip unreadable files */ }
+          }
+      }
+  }
   // ── Publish ───────────────────────────────────────────────────────────────
 
   private async _handlePublish() {
