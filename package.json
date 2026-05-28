@@ -1,6 +1,6 @@
 {
   "name": "dev-agent",
-  "displayName": "Flow Agent \u2014 Accelirate's MuleSoft Assistant",
+  "displayName": "Flow Agent — Accelirate's MuleSoft Assistant",
   "description": "AI-powered RAML, DataWeave and Mule Flow generation directly in VS Code",
   "version": "1.0.0",
   "engines": {
@@ -20,7 +20,7 @@
         {
           "id": "devAgent",
           "title": "Flow Agent",
-          "icon": "media/sidebar.png"
+          "icon": "media/sidebar-4.png"
         }
       ]
     },
@@ -70,8 +70,8 @@
     "watch": "tsc -watch -p ./"
   },
   "devDependencies": {
+    "@types/node": "^20.19.39",
     "@types/vscode": "^1.85.0",
-    "@types/node": "^20.0.0",
     "typescript": "^5.3.0"
   },
   "icon": "media/chat.png"

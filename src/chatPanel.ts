@@ -98,7 +98,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
 
     webviewView.webview.onDidReceiveMessage(async (msg) => {
       switch (msg.type) {
-        case "send":       await this._handleSend(msg.text); break;
+        case "send":       await this._handleSend(msg.text, msg.attachments); break;
         case "newSession": await this.startNewSession(msg.name); break;
         case "publish":    await this._handlePublish(); break;
         case "setMode":    this._setMode(msg.mode); break;
@@ -210,12 +210,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       this._addSystemMessage("🚀 All set. Go ahead.");
 
       this._startFileWatcher();
-
-      if (resp.is_new) {
-          // Workspace already has files (e.g. after a crash/reload)
-          // Scan and upload them so the new session knows what exists
-          await this._syncWorkspaceToSession(resp.session_id);
-      }
+      await this._syncWorkspaceToSession(resp.session_id, resp.files ?? []);
     } catch (e: any) {
       console.log("[DevAgent] startNewSession error:", e.message);
       if (!autoInit) {
@@ -231,7 +226,9 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     const wsFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!wsFolder || !this._sessionId) { return; }
 
-    const pattern = new vscode.RelativePattern(wsFolder, "src/main/resources/api/**/*");
+    const pattern = new vscode.RelativePattern(wsFolder,
+        "{src/main/**/*,src/test/**/*,pom.xml,mule-artifact.json}"
+    );
     this._fileWatcher = vscode.workspace.createFileSystemWatcher(pattern);
 
     const syncFile = async (uri: vscode.Uri) => {
@@ -245,14 +242,36 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       } catch { /* ignore */ }
     };
 
+    const deleteFile = async (uri: vscode.Uri) => {
+      if (!this._sessionId) { return; }
+      try {
+        const relativePath = path.relative(wsFolder, uri.fsPath).replace(/\\/g, "/");
+        await this._put("/session/" + this._sessionId + "/files", {
+          files:         {},
+          deleted_files: [relativePath],
+        });
+        console.log(`[DevAgent] File deleted from session: ${relativePath}`);
+      } catch { /* ignore */ }
+    };
+
     this._fileWatcher.onDidChange(syncFile);
     this._fileWatcher.onDidCreate(syncFile);
+    this._fileWatcher.onDidDelete(deleteFile);   // ← new
   }
 // ── File Sync ──────────────────────────────────────────────────────────
-  private async _syncWorkspaceToSession(sessionId: string): Promise<void> {
+  private async _get(path: string): Promise<any> {
+    const url = this.serverManager.serverUrl + path;
+    const resp = await fetch(url);
+    return resp.json();
+}
+  private async _syncWorkspaceToSession(
+      sessionId: string,
+      sessionFilePaths: string[] = []    // ← files currently in server session
+  ): Promise<void> {
     const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!wsRoot) { return; }
 
+    // Scan workspace files
     const filesToSync: Record<string, string> = {};
     const scanDirs = [
         "src/main/mule",
@@ -260,15 +279,11 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         "src/test/munit",
         "src/test/resources",
     ];
-
     for (const dir of scanDirs) {
         const fullDir = path.join(wsRoot, dir);
         if (!fs.existsSync(fullDir)) { continue; }
-
         this._scanDir(fullDir, wsRoot, filesToSync);
     }
-
-    // Also pick up root-level files
     for (const f of ["pom.xml", "mule-artifact.json", "log4j2.xml"]) {
         const fullPath = path.join(wsRoot, f);
         if (fs.existsSync(fullPath)) {
@@ -276,19 +291,33 @@ export class ChatPanel implements vscode.WebviewViewProvider {
         }
     }
 
-    if (Object.keys(filesToSync).length === 0) { return; }
+    const workspacePaths = Object.keys(filesToSync);
 
-    console.log(`[DevAgent] Syncing ${Object.keys(filesToSync).length} existing workspace files to new session`);
+    // Files in session but NOT in workspace → deleted
+    const deletedFiles = sessionFilePaths.filter(
+        p => !workspacePaths.includes(p)
+    );
+
+    if (workspacePaths.length === 0 && deletedFiles.length === 0) { return; }
+
+    console.log(`[DevAgent] Syncing workspace: `
+        + `${workspacePaths.length} files, ${deletedFiles.length} deleted`);
 
     try {
-        await this._put(`/session/${sessionId}/files`, { files: filesToSync });
+        await this._put(`/session/${sessionId}/files`, {
+            files:         filesToSync,
+            deleted_files: deletedFiles,    // ← remove stale files from session
+        });
         this._addSystemMessage(
-            `📂 Found ${Object.keys(filesToSync).length} existing file(s) in workspace — synced to new session.`
+            `📂 Found ${workspacePaths.length} existing file(s) in workspace — synced to session.`
+            + (deletedFiles.length > 0
+                ? ` Removed ${deletedFiles.length} stale file(s).`
+                : "")
         );
     } catch (e: any) {
         console.error("[DevAgent] Workspace sync failed:", e.message);
     }
-}
+  }
 
   private _scanDir(
       dirPath: string,
@@ -362,8 +391,34 @@ export class ChatPanel implements vscode.WebviewViewProvider {
 
   // ── Send ──────────────────────────────────────────────────────────────────
 
-  private async _handleSend(text: string) {
+  private async _handleSend(text: string,attachments?: []) {
     if (!text.trim()) { return; }
+
+// ── Plan mode guard — block generation commands ───────────────────────
+
+    if (this._mode === "plan") {
+      const lower = text.trim().toLowerCase();
+
+      const isQuestion =
+        lower.endsWith("?") ||
+        /^(what|how|which|when|where|why|can|could|do|does|is|are|will|should|would)\b/.test(lower);
+
+      const isPlanningPhrase =
+        /(what|which).*(required|needed|missing|next|more|else|should|include)/i.test(text) ||
+        /(more detail|clarif|tell me|explain|describe|advise|suggest|recommend)/i.test(text);
+
+      const hasDirectCommand =
+        /^(generate|create|build|make|write|produce|implement|develop|publish)\b/i.test(lower);
+
+      // Only block if it's a direct imperative command — not a question or planning phrase
+      if (hasDirectCommand && !isQuestion && !isPlanningPhrase) {
+        this._post_message({
+          type: "systemMessage",
+          text: "⚠️ You're in **Plan mode** — switch to **Act mode** to generate files.",
+        });
+        return;
+      }
+    }
 
     if (!this._sessionId) {
       const wsFolder = vscode.workspace.workspaceFolders?.[0];
@@ -373,7 +428,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
 
     const userMsg: Message = { role: "user", content: text, mode: this._mode };
     this._messages.push(userMsg);
-    this._post_message({ type: "userMessage", text, mode: this._mode });
+    this._post_message({ type: "userMessage", text, mode: this._mode, attachments: attachments ?? [], });
 
     const assistantMsg: Message = { role: "assistant", content: "", mode: this._mode, thinking: [] };
     this._messages.push(assistantMsg);
@@ -381,7 +436,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
 
     try {
       const planSummary = this._mode === "act" ? this._buildPlanSummary() : "";
-      await this._streamChat(text, planSummary, assistantMsg);
+      await this._streamChat(text, planSummary, assistantMsg, attachments);
     } catch (e: any) {
       this._post_message({
         type: "assistantError",
@@ -390,7 +445,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
     }
   }
 
-  private async _streamChat(text: string, planSummary: string, assistantMsg: Message) {
+  private async _streamChat(text: string, planSummary: string, assistantMsg: Message, attachments?: any[] ) {
     const serverUrl = this.serverManager.serverUrl;
     const url       = new URL(serverUrl + "/chat");
     const body      = JSON.stringify({
@@ -399,6 +454,7 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       user_id:      this._userId,
       mode:         this._mode,
       plan_summary: planSummary,
+      attachments:   attachments ?? [],
     });
 
     return new Promise<void>((resolve, reject) => {
@@ -479,6 +535,32 @@ export class ChatPanel implements vscode.WebviewViewProvider {
       case "error":
         this._post_message({ type: "assistantError", text: event.message });
         break;
+      case "token_update":
+          this._post_message({
+              type:       "tokenUpdate",
+              tokens:     event.tokens,
+              max_tokens: event.max_tokens,
+              pct:        event.pct,
+              level:      event.level,
+          });
+          break;
+      case "token_limit":
+          this._post_message({
+              type:    "systemMessage",
+              text:    `⚠️ ${event.message}`,
+          });
+          this._post_message({
+              type:       "tokenUpdate",
+              tokens:     event.tokens,
+              max_tokens: event.max_tokens,
+              pct:        100,
+              level:      "danger",
+          });
+          this._post_message({
+              type:    "tokenLimit",
+              summary: event.summary,
+          });
+          break;
       case "context_reset": {
         this._addSystemMessage(
           "⚠️ Context limit reached — summarized and continuing automatically…"
@@ -749,6 +831,51 @@ export class ChatPanel implements vscode.WebviewViewProvider {
   #hint { font-size: 10px; color: var(--vscode-descriptionForeground); margin-top: 5px; text-align: center; }
   #brand-logo { width: 36px; height: 36px; vertical-align: middle; margin-right: 8px; flex-shrink: 0; }
   #header h1  { display: flex; align-items: center; font-size: 13px; font-weight: 600; flex: 1; }
+  #attach-btn {
+    background: transparent; border: none; cursor: pointer;
+    color: var(--vscode-descriptionForeground); padding: 0 4px 2px;
+    font-size: 18px; line-height: 1; flex-shrink: 0; border-radius: 4px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #attach-btn:hover { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground); }
+  #attach-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  #attachment-chips {
+    display: flex; flex-wrap: wrap; gap: 4px;
+    padding: 0 0 5px 0;
+  }
+  #attachment-chips:empty { display: none; }
+  .attach-chip {
+    display: inline-flex; align-items: center; gap: 4px;
+    background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
+    font-size: 10px; padding: 2px 6px 2px 8px; border-radius: 10px;
+    max-width: 160px;
+  }
+  .attach-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  .attach-chip button {
+    background: none; border: none; cursor: pointer; padding: 0 1px;
+    color: var(--vscode-badge-foreground); font-size: 11px; line-height: 1; flex-shrink: 0;
+  }
+  .attach-chip button:hover { opacity: 0.7; }
+  #token-bar-wrap {
+    padding: 4px 12px 6px;
+    background: var(--vscode-sideBar-background);
+    border-bottom: 1px solid var(--vscode-panel-border);
+    flex-shrink: 0;
+  }
+  #token-bar-header {
+    display: flex; justify-content: space-between;
+    font-size: 10px; color: var(--vscode-descriptionForeground);
+    margin-bottom: 3px;
+  }
+  #token-track {
+    height: 4px; border-radius: 2px;
+    background: var(--vscode-widget-border); overflow: hidden;
+  }
+  #token-fill {
+    height: 100%; width: 0%; border-radius: 2px;
+    background: var(--vscode-charts-green);
+    transition: width 0.3s ease, background 0.3s ease;
+  }
 </style>
 </head>
 <body class="mode-plan">
@@ -775,6 +902,16 @@ export class ChatPanel implements vscode.WebviewViewProvider {
 </div>
 <div id="mode-hint" class="plan">📋 Plan mode — describe what to build. No files will be written yet</div>
 
+<div id="token-bar-wrap">
+  <div id="token-bar-header">
+    <span>ADK Context</span>
+    <span id="token-label">0 / 35,000</span>
+  </div>
+  <div id="token-track">
+    <div id="token-fill"></div>
+  </div>
+</div>
+
 <div id="messages">
   <div class="msg system">
     <div class="bubble">Connecting to Flow Agent server…</div>
@@ -782,7 +919,12 @@ export class ChatPanel implements vscode.WebviewViewProvider {
 </div>
 
 <div id="input-area">
+  <div id="attachment-chips"></div>
   <div id="input-wrapper">
+    <button id="attach-btn" title="Attach image or document (max 5)">+</button>
+    <input type="file" id="file-input"
+           accept="image/png,image/jpeg,image/jpg,image/gif,.txt,.md,.docx"
+           style="display:none">
     <textarea id="input" rows="1"
       placeholder="Describe the API you want to create…"></textarea>
     <button id="send-btn" title="Send (Enter)">
@@ -800,28 +942,102 @@ let isStreaming   = false;
 let hasSession    = false;
 let currentAssistantEl = null;
 
-// ── Auto-resize textarea ──────────────────────────────────────────────────
-const input = document.getElementById('input');
+// ── Attachment state ──────────────────────────────────────────────────────
+const MAX_ATTACHMENTS  = 5;
+let pendingAttachments = [];   // array of { name, type, mimeType, data }
 
+const attachBtn  = document.getElementById('attach-btn');
+const fileInput  = document.getElementById('file-input');
+const chipsWrap  = document.getElementById('attachment-chips');
+
+attachBtn.addEventListener('click', () => {
+  if (pendingAttachments.length >= MAX_ATTACHMENTS) { return; }
+  fileInput.click();
+});
+
+fileInput.addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file || pendingAttachments.length >= MAX_ATTACHMENTS) { return; }
+  const isImage = file.type.startsWith('image/');
+  const reader  = new FileReader();
+  reader.onload = (ev) => {
+    const idx = pendingAttachments.length;
+    pendingAttachments.push({
+      name:     file.name,
+      mimeType: file.type || 'text/plain',
+      type:     isImage ? 'image' : (file.name.endsWith('.docx') ? 'docx' : 'text'),
+      data:     isImage
+                  ? ev.target.result.split(',')[1]
+                  : btoa(unescape(encodeURIComponent(ev.target.result))),
+    });
+    _renderChips();
+    if (pendingAttachments.length >= MAX_ATTACHMENTS) {
+      attachBtn.disabled = true;
+      attachBtn.title    = 'Maximum 5 attachments reached';
+    }
+  };
+  isImage ? reader.readAsDataURL(file) : reader.readAsText(file);
+  e.target.value = '';
+});
+
+// Event delegation — handles all chip × buttons (CSP-safe, no onclick in HTML)
+chipsWrap.addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-idx]');
+  if (!btn) { return; }
+  const idx = parseInt(btn.getAttribute('data-idx'), 10);
+  pendingAttachments.splice(idx, 1);
+  _renderChips();
+  attachBtn.disabled = pendingAttachments.length >= MAX_ATTACHMENTS;
+  attachBtn.title    = 'Attach image or document (max 5)';
+});
+
+function _renderChips() {
+  chipsWrap.innerHTML = '';
+  pendingAttachments.forEach((a, i) => {
+    const chip = document.createElement('div');
+    chip.className = 'attach-chip';
+    const icon = a.type === 'image' ? '🖼' : '📄';
+    chip.innerHTML =
+      \`<span>\${icon} \${escHtml(a.name)}</span>\` +
+      \`<button data-idx="\${i}" title="Remove">✕</button>\`;
+    chipsWrap.appendChild(chip);
+  });
+}
+
+function clearAttachments() {
+  pendingAttachments = [];
+  chipsWrap.innerHTML = '';
+  attachBtn.disabled = false;
+  attachBtn.title    = 'Attach image or document (max 5)';
+}
+
+// ── Send button + keyboard ────────────────────────────────────────────────
 document.getElementById('send-btn').addEventListener('click', sendMessage);
 
+document.getElementById('input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+
+// ── Auto-resize textarea ──────────────────────────────────────────────────
+document.getElementById('input').addEventListener('input', function () {
+  this.style.height = 'auto';
+  this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+});
+
+// ── New session + publish buttons ─────────────────────────────────────────
+document.getElementById('new-session-btn').addEventListener('click', promptNewSession);
+document.getElementById('publish-btn').addEventListener('click', publishToAnypoint);
+
+// ── Mode toggle ───────────────────────────────────────────────────────────
 document.getElementById('btn-plan').addEventListener('click', () => {
   vscode.postMessage({ type: 'setMode', mode: 'plan' });
 });
-
 document.getElementById('btn-act').addEventListener('click', () => {
   vscode.postMessage({ type: 'setMode', mode: 'act' });
-});
-
-document.getElementById('new-session-btn').addEventListener('click', promptNewSession);
-
-document.getElementById('publish-btn').addEventListener('click', publishToAnypoint);
-input.addEventListener('input', () => {
-  input.style.height = 'auto';
-  input.style.height = Math.min(input.scrollHeight, 140) + 'px';
-});
-input.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 });
 
 // ── Actions ───────────────────────────────────────────────────────────────
@@ -829,7 +1045,13 @@ function sendMessage() {
   const text = input.value.trim();
   if (!text || isStreaming) return;
   input.value = ''; input.style.height = 'auto';
-  vscode.postMessage({ type: 'send', text });
+  const atts = pendingAttachments.length > 0 ? [...pendingAttachments] : [];
+  const msg = { type: 'send', text };
+  if (atts.length > 0) {
+    msg.attachments = atts;
+    clearAttachments();
+  }
+  vscode.postMessage(msg);
 }
 function promptNewSession() {
   const existing = document.getElementById('new-session-input-row');
@@ -882,12 +1104,6 @@ function publishToAnypoint() {
 const messages = document.getElementById('messages');
 function scrollToBottom() { messages.scrollTop = messages.scrollHeight; }
 
-function addUserBubble(text) {
-  const d = document.createElement('div');
-  d.className = 'msg user';
-  d.innerHTML = \`<div class="bubble">\${escHtml(text)}</div>\`;
-  messages.appendChild(d); scrollToBottom();
-}
 function addSystemBubble(text) {
   const d = document.createElement('div');
   d.className = 'msg system';
@@ -938,6 +1154,23 @@ function addFilesBadge(count, changedFiles) {
   const extra = (changedFiles||[]).length > 3 ? \` +\${changedFiles.length-3} more\` : '';
   b.textContent = \`📄 \${count} file(s) written: \${names}\${extra}\`;
   currentAssistantEl.bubble.appendChild(b); scrollToBottom();
+}
+function addUserBubble(text, attachments) {
+  const d = document.createElement('div');
+  d.className = 'msg user';
+  let html = \`<div class="bubble">\${escHtml(text)}\`;
+  if (attachments && attachments.length > 0) {
+    const chips = attachments.map(a => {
+      const icon = a.type === 'image' ? '🖼' : '📄';
+      return \`<span style="display:inline-block;margin-top:5px;margin-right:4px;
+               background:rgba(255,255,255,0.15);border-radius:8px;
+               padding:2px 8px;font-size:10px;">\${icon} \${escHtml(a.name)}</span>\`;
+    }).join('');
+    html += \`<div style="margin-top:4px">\${chips}</div>\`;
+  }
+  html += '</div>';
+  d.innerHTML = html;
+  messages.appendChild(d); scrollToBottom();
 }
 function finishBubble() {
   isStreaming = false;
@@ -993,13 +1226,23 @@ window.addEventListener('message', e => {
     }
     case 'sessionStarted':
       hasSession = true;
+      // Reset token bar for new session
+      const f = document.getElementById('token-fill');
+      const l = document.getElementById('token-label');
+      if (f) { f.style.width = '0%'; f.style.background = 'var(--vscode-charts-green)'; }
+      if (l) { l.textContent = '0 / 35,000'; }
+      // Re-enable input in case it was disabled by token_limit
+      const i = document.getElementById('input');
+      const s = document.getElementById('send-btn');
+      if (i) { i.disabled = false; i.placeholder = 'Describe the API you want to create…'; }
+      if (s) { s.disabled = false; }
       document.getElementById('session-label').textContent = \`📁 \${msg.projectName}\`;
       document.getElementById('publish-btn').disabled = false;
       addSystemBubble(msg.isNew
-        ? \`New session: **\${msg.projectName}**\`
-        : \`Resumed **\${msg.projectName}** — \${msg.fileCount} file(s) on disk\`);
+    ? \`New session: **\${msg.projectName}**\`
+    : \`Resumed **\${msg.projectName}**\`);
       break;
-    case 'userMessage':    addUserBubble(msg.text); break;
+    case 'userMessage':    addUserBubble(msg.text, msg.attachments || []); break;
     case 'assistantStart': startAssistantBubble(); break;
     case 'thinking':       addThinkingStep(msg.label); break;
     case 'toolDone':       markLastThinkingDone(msg.summary); break;
@@ -1007,6 +1250,42 @@ window.addEventListener('message', e => {
     case 'validation':     addValidationBadge(msg.valid, msg.error_count, msg.warning_count); break;
     case 'assistantMessage': setAssistantContent(msg.text); break;
     case 'systemMessage':  addSystemBubble(msg.text); break;
+    case 'tokenUpdate': {
+      const fill  = document.getElementById('token-fill');
+      const label = document.getElementById('token-label');
+      if (!fill || !label) break;
+      fill.style.width = msg.pct + '%';
+      fill.style.background =
+          msg.level === 'danger' ? 'var(--vscode-charts-red)'   :
+          msg.level === 'warn'   ? 'var(--vscode-charts-yellow)' :
+                                    'var(--vscode-charts-green)';
+      label.textContent =
+          msg.tokens.toLocaleString() + ' / ' +
+          msg.max_tokens.toLocaleString();
+      break;
+  }
+    case 'tokenLimit': {
+        const inp = document.getElementById('input');
+        const btn = document.getElementById('send-btn');
+        if (inp) { inp.disabled = true; inp.placeholder = 'Session full — start a new session'; }
+        if (btn) { btn.disabled = true; }
+        const d = document.createElement('div');
+        d.className = 'msg system';
+        const bubble = document.createElement('div');
+        bubble.className = 'bubble';
+        bubble.innerHTML = \`<div style="margin-bottom:8px;font-size:12px;">
+            <strong>Session Summary</strong><br>\${escHtml(msg.summary)}
+        </div>\`;
+        const newBtn = document.createElement('button');
+        newBtn.textContent = '🔄 Start New Session';
+        newBtn.style.cssText = 'width:100%;padding:6px;background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:none;border-radius:4px;cursor:pointer;font-size:12px';
+        newBtn.addEventListener('click', () => vscode.postMessage({ type: 'newSession', name: '' }));
+        bubble.appendChild(newBtn);
+        d.appendChild(bubble);
+        messages.appendChild(d);
+        scrollToBottom();
+        break;
+    }
     case 'assistantError':
       if (currentAssistantEl) {
         currentAssistantEl.contentEl.innerHTML =
