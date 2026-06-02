@@ -1121,19 +1121,30 @@ function startAssistantBubble() {
   messages.appendChild(div); scrollToBottom();
   currentAssistantEl = { div, bubble, thinkingEl: tEl, contentEl: cEl };
 }
-function addThinkingStep(label) {
+function addThinkingStep(tool, label) {
   if (!currentAssistantEl) return;
-  const s = document.createElement('div'); s.className = 'thinking-step';
+  const s = document.createElement('div');
+  s.className = 'thinking-step';
+  s.dataset.tool = tool || '';
   s.innerHTML = \`<span class="dot"></span><span class="spinner"></span><span>\${escHtml(label)}</span>\`;
-  currentAssistantEl.thinkingEl.appendChild(s); scrollToBottom();
+  currentAssistantEl.thinkingEl.appendChild(s);
+  scrollToBottom();
 }
-function markLastThinkingDone(summary) {
+function markThinkingDone(tool, summary) {
   if (!currentAssistantEl) return;
-  const steps = currentAssistantEl.thinkingEl.querySelectorAll('.thinking-step');
-  const last  = steps[steps.length - 1]; if (!last) return;
-  last.classList.add('done');
-  last.querySelector('.spinner')?.remove();
-  const lbl = last.querySelector('span:last-child');
+  // Try to match by tool name first
+  let step = tool
+    ? currentAssistantEl.thinkingEl.querySelector(\`.thinking-step[data-tool="\${tool}"]:not(.done)\`)
+    : null;
+  // Fallback to last undone step
+  if (!step) {
+    const steps = currentAssistantEl.thinkingEl.querySelectorAll('.thinking-step:not(.done)');
+    step = steps[steps.length - 1];
+  }
+  if (!step) return;
+  step.classList.add('done');
+  step.querySelector('.spinner')?.remove();
+  const lbl = step.querySelector('span:last-child');
   if (lbl && summary) lbl.textContent = summary;
 }
 function setAssistantContent(text) {
@@ -1244,8 +1255,8 @@ window.addEventListener('message', e => {
       break;
     case 'userMessage':    addUserBubble(msg.text, msg.attachments || []); break;
     case 'assistantStart': startAssistantBubble(); break;
-    case 'thinking':       addThinkingStep(msg.label); break;
-    case 'toolDone':       markLastThinkingDone(msg.summary); break;
+    case 'thinking': addThinkingStep(msg.tool, msg.label); break;
+    case 'toolDone': markThinkingDone(msg.tool, msg.summary); break;
     case 'filesWritten':   addFilesBadge(msg.count, msg.changedFiles); break;
     case 'validation':     addValidationBadge(msg.valid, msg.error_count, msg.warning_count); break;
     case 'assistantMessage': setAssistantContent(msg.text); break;
