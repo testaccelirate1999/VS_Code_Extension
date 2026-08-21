@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Compiled extension output (rebuilt via `npm run compile`)
+out/
+
+# Packaged extension bundles
+*.vsix
+
+# Logs
+npm-debug.log*
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+*.code-workspace

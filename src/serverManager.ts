@@ -1,6 +1,10 @@
 // src/serverManager.ts
 import * as vscode from "vscode";
 import * as http from "http";
+import * as https from "https";
+
+//const DEFAULT_SERVER_URL = "https://devagent-production-64bc.up.railway.app";
+const DEFAULT_SERVER_URL = "http://localhost:8002";
 
 export class ServerManager {
   private _onStatusChange = new vscode.EventEmitter<string>();
@@ -13,9 +17,7 @@ export class ServerManager {
   get status() { return this._status; }
 
   get serverUrl(): string {
-    return vscode.workspace
-      .getConfiguration("devAgent")
-      .get("serverUrl", "http://localhost:8002");
+    return DEFAULT_SERVER_URL;
   }
 
   async checkAndNotify() {
@@ -43,11 +45,12 @@ export class ServerManager {
     return new Promise((resolve) => {
       const url = new URL(`${this.serverUrl}/health`);
       console.log("[DevAgent] pinging:", url.hostname, url.port, url.pathname);
-      const req = http.get(
-        { hostname: url.hostname, port: Number(url.port) || 8002,
-          path: url.pathname, timeout: 2000 },
+      const lib = url.protocol === "https:" ? https : http;
+      const req = lib.get(
+        { hostname: url.hostname, port: Number(url.port) || (url.protocol === "https:" ? 443 : 8002),
+          path: url.pathname, timeout: 10000 },
         (res) => {resolve(res.statusCode === 200),console.log("[DevAgent] ping response status:", res.statusCode);}
-        
+
       );
       req.on("error",   (e) => {resolve(false),console.log("[DevAgent] ping error:", e.message);});
       req.on("timeout", () => { req.destroy(); resolve(false); });

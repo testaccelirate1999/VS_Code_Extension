@@ -14,7 +14,8 @@ export class FileWriter {
   async writeFiles(
     files: Record<string, string>,
     changedFiles: string[],
-    deletedFiles: string[]
+    deletedFiles: string[],
+    binaryFiles: Record<string, string> = {}
   ): Promise<string[]> {
     if (!this.workspaceRoot) {
       vscode.window.showErrorMessage(
@@ -24,6 +25,7 @@ export class FileWriter {
     }
 
     const written: string[] = [];
+    const writtenText: string[] = [];
 
     for (const [relativePath, content] of Object.entries(files)) {
       if (changedFiles.length > 0 && !changedFiles.includes(relativePath)) {
@@ -33,6 +35,17 @@ export class FileWriter {
       fs.mkdirSync(path.dirname(fullPath), { recursive: true });
       fs.writeFileSync(fullPath, content, "utf8");
       written.push(fullPath);
+      writtenText.push(fullPath);
+    }
+
+    for (const [relativePath, base64Content] of Object.entries(binaryFiles)) {
+      if (changedFiles.length > 0 && !changedFiles.includes(relativePath)) {
+        continue;
+      }
+      const fullPath = path.join(this.workspaceRoot, relativePath);
+      fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+      fs.writeFileSync(fullPath, Buffer.from(base64Content, "base64"));
+      written.push(fullPath);
     }
 
     for (const relativePath of deletedFiles) {
@@ -40,8 +53,8 @@ export class FileWriter {
       if (fs.existsSync(fullPath)) { fs.unlinkSync(fullPath); }
     }
 
-    if (written.length > 0) {
-      const uri = vscode.Uri.file(written[0]);
+    if (writtenText.length > 0) {
+      const uri = vscode.Uri.file(writtenText[0]);
       await vscode.window.showTextDocument(uri, {
         preview: false, viewColumn: vscode.ViewColumn.One,
       });
